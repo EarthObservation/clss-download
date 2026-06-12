@@ -87,6 +87,10 @@ class ClssError(RuntimeError):
     """Domain error for user-facing CLI failures."""
 
 
+class DownloadCancelled(Exception):
+    """Raised when a download is cancelled by user interrupt."""
+
+
 class ProgressReporter:
     def __init__(self, total_files: int, mode: str):
         self.mode = mode
@@ -865,9 +869,13 @@ def download_one(
     overwrite: bool,
     timeout: float,
     reporter: ProgressReporter | None = None,
+    stop_event: threading.Event | None = None,
 ) -> tuple[str, DownloadPlan]:
     destination = plan.destination
     destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if stop_event is not None and stop_event.is_set():
+        raise DownloadCancelled()
 
     if destination.exists() and not overwrite:
         return "skipped", plan
@@ -882,12 +890,14 @@ def download_one(
                 reporter.add_file_total(content_length)
             with temp_path.open("wb") as handle:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if stop_event is not None and stop_event.is_set():
+                        raise DownloadCancelled()
                     if chunk:
                         handle.write(chunk)
                         if reporter is not None:
                             reporter.advance_bytes(len(chunk))
         temp_path.replace(destination)
-    except Exception:
+    except BaseException:
         if temp_path.exists():
             temp_path.unlink()
         raise
@@ -990,39 +1000,56 @@ def run_download_command(args: argparse.Namespace) -> int:
 
     successes = 0
     skipped = 0
+    cancelled = 0
     failures: list[tuple[DownloadPlan, Exception]] = []
+    interrupted = False
+    stop_event = threading.Event()
 
     try:
         with session:
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
                 futures = {
-                    executor.submit(download_one, session, item, args.overwrite, args.timeout, reporter): item
+                    executor.submit(download_one, session, item, args.overwrite, args.timeout, reporter, stop_event): item
                     for item in plan
                 }
-                for future in as_completed(futures):
-                    item = futures[future]
-                    try:
-                        status, finished = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        failures.append((item, exc))
-                        reporter.mark_file_finished()
-                        reporter.write(
-                            f"FAILED   {item.product.upper():4} {item.tile_name:>8}  {item.url}  ({exc})",
-                            stream=sys.stderr,
-                        )
-                        continue
+                try:
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
+                            status, finished = future.result()
+                        except DownloadCancelled:
+                            cancelled += 1
+                            reporter.mark_file_finished()
+                            reporter.write(f"CANCEL   {item.product.upper():4} {item.tile_name:>8}  {item.destination}")
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            failures.append((item, exc))
+                            reporter.mark_file_finished()
+                            reporter.write(
+                                f"FAILED   {item.product.upper():4} {item.tile_name:>8}  {item.url}  ({exc})",
+                                stream=sys.stderr,
+                            )
+                            continue
 
-                    reporter.mark_file_finished()
-                    if status == "skipped":
-                        skipped += 1
-                        reporter.write(f"SKIPPED  {finished.product.upper():4} {finished.tile_name:>8}  {finished.destination}")
-                    else:
-                        successes += 1
-                        reporter.write(f"DONE     {finished.product.upper():4} {finished.tile_name:>8}  {finished.destination}")
+                        reporter.mark_file_finished()
+                        if status == "skipped":
+                            skipped += 1
+                            reporter.write(f"SKIPPED  {finished.product.upper():4} {finished.tile_name:>8}  {finished.destination}")
+                        else:
+                            successes += 1
+                            reporter.write(f"DONE     {finished.product.upper():4} {finished.tile_name:>8}  {finished.destination}")
+                except KeyboardInterrupt:
+                    interrupted = True
+                    stop_event.set()
+                    cancelled += sum(1 for future in futures if future.cancel())
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    reporter.write("Interrupted by user. Stopping active downloads...", stream=sys.stderr)
     finally:
         reporter.close()
 
-    print(f"Finished: {successes} downloaded, {skipped} skipped, {len(failures)} failed.")
+    print(f"Finished: {successes} downloaded, {skipped} skipped, {cancelled} cancelled, {len(failures)} failed.")
+    if interrupted:
+        return 130
     return 0 if not failures else 2
 
 
@@ -1142,6 +1169,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except requests.RequestException as exc:
         print(f"Request error: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("Interrupted by user.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

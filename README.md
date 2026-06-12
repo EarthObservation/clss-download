@@ -330,6 +330,7 @@ Use `--flat` to store only the filenames directly in the output directory.
 - Real downloads use `--progress auto` by default.
 - `auto` uses `tqdm` in normal TTY terminals and falls back to plain ASCII progress in less capable consoles.
 - If `tqdm` is not installed, the CLI will say so and fall back to plain progress.
+- `Ctrl+C` stops queued and active downloads as cleanly as possible and removes partial `.part` files.
 - Use `--no-progress` if you want completion logs without progress updates.
 
 ## Useful Options
