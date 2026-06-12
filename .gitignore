@@ -1,0 +1,4 @@
+.clss_headers.env
+downloads/
+__pycache__/
+*.pyc
