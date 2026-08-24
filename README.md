@@ -359,6 +359,13 @@ The public CLSS instructions mention:
 
 This CLI warns when your requested batch exceeds those counts, but it does not enforce them.
 
+## Acknowledgment
+
+Development of the CLSS Download CLI was partly financed by the Slovenian Research Agency through the following projects:
+
+- P2-0406 — EOGeo — Earth Observation and Geoinformatics
+- GC-0006 — GeoAI — Geospatial Information Technologies for a Resilient and Sustainable Society
+
 ## Author
 
 Krištof Oštir, UL FGG
