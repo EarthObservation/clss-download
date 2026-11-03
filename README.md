@@ -205,6 +205,34 @@ Download from a text file of tile names:
 python clss_download.py download --tiles-file my_tiles.txt --product gkot
 ```
 
+## Retrying Failed Downloads
+
+Failed files are recorded in `<out-dir>/failed_downloads.log` as CSV with these columns:
+
+```text
+timestamp,tile_name,product,url,destination,error
+```
+
+Retry the exact failed URLs and destinations:
+
+```bash
+python clss_download.py retry
+```
+
+Preview the retry plan without downloading:
+
+```bash
+python clss_download.py retry --dry-run
+```
+
+Use a custom failure log:
+
+```bash
+python clss_download.py retry --failure-log path/to/failed_downloads.log
+```
+
+`retry` uses the logged URL and destination, so it does not need `--area`, `--tile`, `--product`, `--out-dir`, `--flat`, or `--semi-flat`. It overwrites the failure log with only the files that fail again, so successful retries disappear from the log. Run it from the same working directory as the original download, or use an absolute `--out-dir`/`--failure-log` path.
+
 ## Usage
 
 Show help:
@@ -330,6 +358,12 @@ Use `--flat` to store only the filenames directly in the output directory.
 - Real downloads use `--progress auto` by default.
 - `auto` uses `tqdm` in normal TTY terminals and falls back to plain ASCII progress in less capable consoles.
 - If `tqdm` is not installed, the CLI will say so and fall back to plain progress.
+- Downloads are split into sequential batches of at most 10 tiles.
+- A 3-second pause is inserted between batches by default; change it with `--batch-delay`.
+- A failed file does not stop the remaining batches; failures are reported in the final summary.
+- Failed downloads are written to `<out-dir>/failed_downloads.log` as CSV; the file is overwritten at the start of each real download run.
+- `--failure-log PATH` selects a different failure log location.
+- `retry` re-downloads the exact URLs and destinations from the failure log and replaces the log with any remaining failures.
 - `Ctrl+C` stops queued and active downloads as cleanly as possible and removes partial `.part` files.
 - Use `--no-progress` if you want completion logs without progress updates.
 
@@ -340,7 +374,9 @@ Use `--flat` to store only the filenames directly in the output directory.
 - `--flat`: do not preserve CLSS folder structure
 - `--overwrite`: replace existing files
 - `--dry-run`: print the plan only
-- `--workers 2`: concurrent downloads
+- `--workers 2`: concurrent downloads within a batch
+- `--batch-delay 3`: seconds to wait between 10-tile download batches
+- `--failure-log PATH`: CSV file for failed downloads; default `<out-dir>/failed_downloads.log`
 - `--timeout 120`: request timeout in seconds
 - `--layer my_layer`: GeoPackage layer name for AOI input
 - `--trust-env-proxy`: use proxy settings from the environment
@@ -357,7 +393,7 @@ The public CLSS instructions mention:
 - up to 10 blocks at once in the web bulk-download workflow
 - up to 20 downloads per day in the viewer workflow
 
-This CLI warns when your requested batch exceeds those counts, but it does not enforce them.
+This CLI enforces the 10-tile limit by splitting downloads into sequential batches of up to 10 tiles. It warns when a request exceeds 20 files, but does not enforce the viewer's daily download limit.
 
 ## Acknowledgment
 
