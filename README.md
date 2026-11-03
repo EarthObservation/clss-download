@@ -330,6 +330,9 @@ Use `--flat` to store only the filenames directly in the output directory.
 - Real downloads use `--progress auto` by default.
 - `auto` uses `tqdm` in normal TTY terminals and falls back to plain ASCII progress in less capable consoles.
 - If `tqdm` is not installed, the CLI will say so and fall back to plain progress.
+- Downloads are split into sequential batches of at most 10 tiles.
+- A 3-second pause is inserted between batches by default; change it with `--batch-delay`.
+- A failed file does not stop the remaining batches; failures are reported in the final summary.
 - `Ctrl+C` stops queued and active downloads as cleanly as possible and removes partial `.part` files.
 - Use `--no-progress` if you want completion logs without progress updates.
 
@@ -340,7 +343,8 @@ Use `--flat` to store only the filenames directly in the output directory.
 - `--flat`: do not preserve CLSS folder structure
 - `--overwrite`: replace existing files
 - `--dry-run`: print the plan only
-- `--workers 2`: concurrent downloads
+- `--workers 2`: concurrent downloads within a batch
+- `--batch-delay 3`: seconds to wait between 10-tile download batches
 - `--timeout 120`: request timeout in seconds
 - `--layer my_layer`: GeoPackage layer name for AOI input
 - `--trust-env-proxy`: use proxy settings from the environment
@@ -357,7 +361,7 @@ The public CLSS instructions mention:
 - up to 10 blocks at once in the web bulk-download workflow
 - up to 20 downloads per day in the viewer workflow
 
-This CLI warns when your requested batch exceeds those counts, but it does not enforce them.
+This CLI enforces the 10-tile limit by splitting downloads into sequential batches of up to 10 tiles. It warns when a request exceeds 20 files, but does not enforce the viewer's daily download limit.
 
 ## Acknowledgment
 

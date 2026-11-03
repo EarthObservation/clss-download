@@ -55,6 +55,7 @@ BASE_URL = "https://assets.flycom.si/"
 DEFAULT_TILE_INDEX = Path(__file__).resolve().parent / "data" / "clss_mreza_2325.gpkg"
 DEFAULT_HEADERS_FILE = Path(__file__).resolve().parent / ".clss_headers.env"
 SUPPORTED_PRODUCTS = ("gkot", "dmr", "dmp", "ndmp", "pas", "pof", "pofi")
+TILE_BATCH_SIZE = 10
 GEOMETRY_EPSILON = 1e-9
 
 
@@ -797,6 +798,33 @@ def build_download_plan(
     return plan
 
 
+def split_plan_into_tile_batches(
+    plan: Sequence[DownloadPlan],
+    batch_size: int = TILE_BATCH_SIZE,
+) -> list[list[DownloadPlan]]:
+    if batch_size <= 0:
+        raise ClssError("Tile batch size must be greater than zero.")
+
+    batches: list[list[DownloadPlan]] = []
+    current: list[DownloadPlan] = []
+    current_tiles = 0
+    previous_tile: str | None = None
+
+    for item in plan:
+        if item.tile_name != previous_tile:
+            if current and current_tiles >= batch_size:
+                batches.append(current)
+                current = []
+                current_tiles = 0
+            current_tiles += 1
+            previous_tile = item.tile_name
+        current.append(item)
+
+    if current:
+        batches.append(current)
+    return batches
+
+
 def format_size_mb(size_mb: float | None) -> str:
     if size_mb is None:
         return "unknown"
@@ -911,10 +939,12 @@ def print_tile_table(tiles: Sequence[TileRecord]) -> None:
         print(f"  {tile.tile_name}  {tile.origin_name}  [{products}]")
 
 
-def warn_if_limits_are_large(tile_count: int, file_count: int) -> None:
-    if tile_count > 10:
+def warn_if_limits_are_large(tile_count: int, file_count: int, batch_delay: float) -> None:
+    if tile_count > TILE_BATCH_SIZE:
+        batch_count = math.ceil(tile_count / TILE_BATCH_SIZE)
         print(
-            "Warning: the official CLSS instructions mention a 10-tile limit for bulk selection in the viewer.",
+            f"Info: {tile_count} tiles will be downloaded in {batch_count} sequential batches "
+            f"of up to {TILE_BATCH_SIZE} tiles, with a {batch_delay:g}s pause between batches.",
             file=sys.stderr,
         )
     if file_count > 20:
@@ -945,72 +975,49 @@ def run_tiles_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_download_command(args: argparse.Namespace) -> int:
-    catalog = TileCatalog(args.tile_index)
-    products = resolve_products(args.product or [])
-    explicit_tiles = parse_tile_tokens(args.tile or [])
-    if args.tiles_file:
-        explicit_tiles.extend(read_tiles_file(args.tiles_file))
+def download_plan_in_batches(
+    session: requests.Session,
+    plan: Sequence[DownloadPlan],
+    *,
+    workers: int,
+    overwrite: bool,
+    timeout: float,
+    batch_delay: float,
+    reporter: ProgressReporter,
+    stop_event: threading.Event,
+) -> tuple[int, int, int, list[tuple[DownloadPlan, Exception]], bool]:
+    if batch_delay < 0:
+        raise ClssError("Batch delay must not be negative.")
 
-    tiles = resolve_tiles(
-        catalog=catalog,
-        area_path=args.area,
-        area_layer=args.layer,
-        assume_srid=args.assume_srid,
-        explicit_tiles=explicit_tiles,
-    )
-    output_layout = resolve_output_layout(flat=args.flat, semi_flat=args.semi_flat)
-    plan = build_download_plan(tiles, products=products, out_dir=args.out_dir, layout=output_layout)
-
-    print_tile_table(tiles)
-    print(f"Prepared {len(plan)} file(s) for download:")
-    total_size_mb = 0.0
-    total_size_known = True
-    for item in plan:
-        if item.expected_size_mb is None:
-            total_size_known = False
-        else:
-            total_size_mb += item.expected_size_mb
-        print(f"  {item.product.upper():4}  {item.tile_name:>8}  {format_size_mb(item.expected_size_mb):>10}  {item.destination}")
-    if total_size_known:
-        print(f"Estimated total size: {total_size_mb:.2f} MB")
-
-    warn_if_limits_are_large(tile_count=len(tiles), file_count=len(plan))
-
-    if args.dry_run:
-        return 0
-
-    referer, user_agent = resolve_request_headers(
-        referer_arg=args.referer,
-        user_agent_arg=args.user_agent,
-        headers_file=args.headers_file,
-    )
-    session = make_session(
-        referer=referer,
-        user_agent=user_agent,
-        trust_env_proxy=args.trust_env_proxy,
-    )
-    progress_mode = "off"
-    progress_note = None
-    if not args.no_progress:
-        progress_mode, progress_note = resolve_progress_mode(args.progress)
-    reporter = ProgressReporter(total_files=len(plan), mode=progress_mode)
-    if progress_note:
-        reporter.write(f"Note: {progress_note}")
-
+    batches = split_plan_into_tile_batches(plan)
     successes = 0
     skipped = 0
     cancelled = 0
     failures: list[tuple[DownloadPlan, Exception]] = []
     interrupted = False
-    stop_event = threading.Event()
 
-    try:
-        with session:
-            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    for batch_index, batch in enumerate(batches, start=1):
+        if stop_event.is_set():
+            break
+
+        tile_count = len({item.tile_name for item in batch})
+        reporter.write(
+            f"Batch {batch_index}/{len(batches)}: {tile_count} tile(s), {len(batch)} file(s)"
+        )
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
-                    executor.submit(download_one, session, item, args.overwrite, args.timeout, reporter, stop_event): item
-                    for item in plan
+                    executor.submit(
+                        download_one,
+                        session,
+                        item,
+                        overwrite,
+                        timeout,
+                        reporter,
+                        stop_event,
+                    ): item
+                    for item in batch
                 }
                 try:
                     for future in as_completed(futures):
@@ -1044,6 +1051,95 @@ def run_download_command(args: argparse.Namespace) -> int:
                     cancelled += sum(1 for future in futures if future.cancel())
                     executor.shutdown(wait=False, cancel_futures=True)
                     reporter.write("Interrupted by user. Stopping active downloads...", stream=sys.stderr)
+                    break
+        except KeyboardInterrupt:
+            interrupted = True
+            stop_event.set()
+            reporter.write("Interrupted by user. Stopping active downloads...", stream=sys.stderr)
+            break
+
+        if batch_index < len(batches) and batch_delay > 0:
+            try:
+                time.sleep(batch_delay)
+            except KeyboardInterrupt:
+                interrupted = True
+                stop_event.set()
+                reporter.write("Interrupted by user. Stopping active downloads...", stream=sys.stderr)
+                break
+
+    return successes, skipped, cancelled, failures, interrupted
+
+
+def run_download_command(args: argparse.Namespace) -> int:
+    if args.batch_delay < 0:
+        raise ClssError("Batch delay must not be negative.")
+
+    catalog = TileCatalog(args.tile_index)
+    products = resolve_products(args.product or [])
+    explicit_tiles = parse_tile_tokens(args.tile or [])
+    if args.tiles_file:
+        explicit_tiles.extend(read_tiles_file(args.tiles_file))
+
+    tiles = resolve_tiles(
+        catalog=catalog,
+        area_path=args.area,
+        area_layer=args.layer,
+        assume_srid=args.assume_srid,
+        explicit_tiles=explicit_tiles,
+    )
+    output_layout = resolve_output_layout(flat=args.flat, semi_flat=args.semi_flat)
+    plan = build_download_plan(tiles, products=products, out_dir=args.out_dir, layout=output_layout)
+
+    print_tile_table(tiles)
+    print(f"Prepared {len(plan)} file(s) for download:")
+    total_size_mb = 0.0
+    total_size_known = True
+    for item in plan:
+        if item.expected_size_mb is None:
+            total_size_known = False
+        else:
+            total_size_mb += item.expected_size_mb
+        print(f"  {item.product.upper():4}  {item.tile_name:>8}  {format_size_mb(item.expected_size_mb):>10}  {item.destination}")
+    if total_size_known:
+        print(f"Estimated total size: {total_size_mb:.2f} MB")
+
+    warn_if_limits_are_large(tile_count=len(tiles), file_count=len(plan), batch_delay=args.batch_delay)
+
+    if args.dry_run:
+        return 0
+
+    referer, user_agent = resolve_request_headers(
+        referer_arg=args.referer,
+        user_agent_arg=args.user_agent,
+        headers_file=args.headers_file,
+    )
+    session = make_session(
+        referer=referer,
+        user_agent=user_agent,
+        trust_env_proxy=args.trust_env_proxy,
+    )
+    progress_mode = "off"
+    progress_note = None
+    if not args.no_progress:
+        progress_mode, progress_note = resolve_progress_mode(args.progress)
+    reporter = ProgressReporter(total_files=len(plan), mode=progress_mode)
+    if progress_note:
+        reporter.write(f"Note: {progress_note}")
+
+    stop_event = threading.Event()
+
+    try:
+        with session:
+            successes, skipped, cancelled, failures, interrupted = download_plan_in_batches(
+                session,
+                plan,
+                workers=args.workers,
+                overwrite=args.overwrite,
+                timeout=args.timeout,
+                batch_delay=args.batch_delay,
+                reporter=reporter,
+                stop_event=stop_event,
+            )
     finally:
         reporter.close()
 
@@ -1116,6 +1212,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="Concurrent downloads to run at once. Default: 2",
+    )
+    download_parser.add_argument(
+        "--batch-delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait between 10-tile download batches. Default: 3",
     )
     download_parser.add_argument(
         "--timeout",
