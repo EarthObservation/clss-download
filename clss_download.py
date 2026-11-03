@@ -30,6 +30,7 @@ Download DMR + DMP for all tiles intersecting an AOI:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -40,6 +41,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 from urllib.parse import urljoin
@@ -54,6 +56,9 @@ except ImportError:  # pragma: no cover - optional dependency fallback
 BASE_URL = "https://assets.flycom.si/"
 DEFAULT_TILE_INDEX = Path(__file__).resolve().parent / "data" / "clss_mreza_2325.gpkg"
 DEFAULT_HEADERS_FILE = Path(__file__).resolve().parent / ".clss_headers.env"
+DEFAULT_OUT_DIR = Path("downloads")
+FAILURE_LOG_NAME = "failed_downloads.log"
+FAILURE_LOG_COLUMNS = ("timestamp", "tile_name", "product", "url", "destination", "error")
 SUPPORTED_PRODUCTS = ("gkot", "dmr", "dmp", "ndmp", "pas", "pof", "pofi")
 TILE_BATCH_SIZE = 10
 GEOMETRY_EPSILON = 1e-9
@@ -82,6 +87,13 @@ class DownloadPlan:
     url: str
     destination: Path
     expected_size_mb: float | None
+
+
+@dataclass(frozen=True)
+class FailureRecord:
+    timestamp: datetime
+    plan: DownloadPlan
+    error: Exception
 
 
 class ClssError(RuntimeError):
@@ -954,6 +966,76 @@ def warn_if_limits_are_large(tile_count: int, file_count: int, batch_delay: floa
         )
 
 
+def reset_failure_log(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(FAILURE_LOG_COLUMNS)
+
+
+def append_failure_log(path: Path, failures: Sequence[FailureRecord]) -> None:
+    if not failures:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        for failure in failures:
+            writer.writerow(
+                (
+                    failure.timestamp.isoformat(timespec="seconds"),
+                    failure.plan.tile_name,
+                    failure.plan.product,
+                    failure.plan.url,
+                    str(failure.plan.destination),
+                    f"{type(failure.error).__name__}: {failure.error}",
+                )
+            )
+
+
+def load_failure_plan(path: Path) -> list[DownloadPlan]:
+    if not path.exists():
+        raise ClssError(f"Failure log not found: {path}")
+
+    required_columns = ("tile_name", "product", "url", "destination")
+    plans: dict[tuple[str, str, str, str], DownloadPlan] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        missing = [column for column in required_columns if column not in fieldnames]
+        if missing:
+            raise ClssError(f"Failure log {path} is missing required column(s): {', '.join(missing)}.")
+
+        for line_number, row in enumerate(reader, start=2):
+            tile_name = (row.get("tile_name") or "").strip()
+            product = (row.get("product") or "").strip().lower()
+            url = (row.get("url") or "").strip()
+            destination = (row.get("destination") or "").strip()
+            if not tile_name or not product or not url or not destination:
+                raise ClssError(f"Failure log {path} has an empty required field at line {line_number}.")
+            if product not in SUPPORTED_PRODUCTS:
+                raise ClssError(f"Failure log {path} has unsupported product {product!r} at line {line_number}.")
+
+            plan = DownloadPlan(
+                tile_name=tile_name,
+                product=product,
+                url=url,
+                destination=Path(destination),
+                expected_size_mb=None,
+            )
+            key = (plan.tile_name, plan.product, plan.url, str(plan.destination))
+            plans.setdefault(key, plan)
+
+    if not plans:
+        raise ClssError(f"No failed downloads found in {path}.")
+
+    product_order = {product: index for index, product in enumerate(SUPPORTED_PRODUCTS)}
+    return sorted(
+        plans.values(),
+        key=lambda item: (item.tile_name, product_order.get(item.product, len(SUPPORTED_PRODUCTS))),
+    )
+
+
 def run_tiles_command(args: argparse.Namespace) -> int:
     catalog = TileCatalog(args.tile_index)
     explicit_tiles = parse_tile_tokens(args.tile or [])
@@ -985,7 +1067,7 @@ def download_plan_in_batches(
     batch_delay: float,
     reporter: ProgressReporter,
     stop_event: threading.Event,
-) -> tuple[int, int, int, list[tuple[DownloadPlan, Exception]], bool]:
+) -> tuple[int, int, int, list[FailureRecord], bool]:
     if batch_delay < 0:
         raise ClssError("Batch delay must not be negative.")
 
@@ -993,7 +1075,7 @@ def download_plan_in_batches(
     successes = 0
     skipped = 0
     cancelled = 0
-    failures: list[tuple[DownloadPlan, Exception]] = []
+    failures: list[FailureRecord] = []
     interrupted = False
 
     for batch_index, batch in enumerate(batches, start=1):
@@ -1030,7 +1112,7 @@ def download_plan_in_batches(
                             reporter.write(f"CANCEL   {item.product.upper():4} {item.tile_name:>8}  {item.destination}")
                             continue
                         except Exception as exc:  # noqa: BLE001
-                            failures.append((item, exc))
+                            failures.append(FailureRecord(datetime.now(timezone.utc), item, exc))
                             reporter.mark_file_finished()
                             reporter.write(
                                 f"FAILED   {item.product.upper():4} {item.tile_name:>8}  {item.url}  ({exc})",
@@ -1068,6 +1150,57 @@ def download_plan_in_batches(
                 break
 
     return successes, skipped, cancelled, failures, interrupted
+
+
+def run_plan_downloads(
+    args: argparse.Namespace,
+    plan: Sequence[DownloadPlan],
+    failure_log: Path,
+) -> int:
+    referer, user_agent = resolve_request_headers(
+        referer_arg=args.referer,
+        user_agent_arg=args.user_agent,
+        headers_file=args.headers_file,
+    )
+    session = make_session(
+        referer=referer,
+        user_agent=user_agent,
+        trust_env_proxy=args.trust_env_proxy,
+    )
+    progress_mode = "off"
+    progress_note = None
+    if not args.no_progress:
+        progress_mode, progress_note = resolve_progress_mode(args.progress)
+    reporter = ProgressReporter(total_files=len(plan), mode=progress_mode)
+    if progress_note:
+        reporter.write(f"Note: {progress_note}")
+
+    reset_failure_log(failure_log)
+    stop_event = threading.Event()
+
+    try:
+        with session:
+            successes, skipped, cancelled, failures, interrupted = download_plan_in_batches(
+                session,
+                plan,
+                workers=args.workers,
+                overwrite=args.overwrite,
+                timeout=args.timeout,
+                batch_delay=args.batch_delay,
+                reporter=reporter,
+                stop_event=stop_event,
+            )
+    finally:
+        reporter.close()
+
+    append_failure_log(failure_log, failures)
+
+    print(f"Finished: {successes} downloaded, {skipped} skipped, {cancelled} cancelled, {len(failures)} failed.")
+    if failures:
+        print(f"Failure log: {failure_log}")
+    if interrupted:
+        return 130
+    return 0 if not failures else 2
 
 
 def run_download_command(args: argparse.Namespace) -> int:
@@ -1108,45 +1241,26 @@ def run_download_command(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
-    referer, user_agent = resolve_request_headers(
-        referer_arg=args.referer,
-        user_agent_arg=args.user_agent,
-        headers_file=args.headers_file,
-    )
-    session = make_session(
-        referer=referer,
-        user_agent=user_agent,
-        trust_env_proxy=args.trust_env_proxy,
-    )
-    progress_mode = "off"
-    progress_note = None
-    if not args.no_progress:
-        progress_mode, progress_note = resolve_progress_mode(args.progress)
-    reporter = ProgressReporter(total_files=len(plan), mode=progress_mode)
-    if progress_note:
-        reporter.write(f"Note: {progress_note}")
+    failure_log = args.failure_log or (args.out_dir / FAILURE_LOG_NAME)
+    return run_plan_downloads(args, plan, failure_log)
 
-    stop_event = threading.Event()
 
-    try:
-        with session:
-            successes, skipped, cancelled, failures, interrupted = download_plan_in_batches(
-                session,
-                plan,
-                workers=args.workers,
-                overwrite=args.overwrite,
-                timeout=args.timeout,
-                batch_delay=args.batch_delay,
-                reporter=reporter,
-                stop_event=stop_event,
-            )
-    finally:
-        reporter.close()
+def run_retry_command(args: argparse.Namespace) -> int:
+    if args.batch_delay < 0:
+        raise ClssError("Batch delay must not be negative.")
 
-    print(f"Finished: {successes} downloaded, {skipped} skipped, {cancelled} cancelled, {len(failures)} failed.")
-    if interrupted:
-        return 130
-    return 0 if not failures else 2
+    failure_log = args.failure_log or (DEFAULT_OUT_DIR / FAILURE_LOG_NAME)
+    plan = load_failure_plan(failure_log)
+
+    print(f"Prepared {len(plan)} failed file(s) for retry:")
+    for item in plan:
+        print(f"  {item.product.upper():4}  {item.tile_name:>8}  {item.url}  ->  {item.destination}")
+    print(f"Failure log: {failure_log}")
+
+    if args.dry_run:
+        return 0
+
+    return run_plan_downloads(args, plan, failure_log)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1177,6 +1291,53 @@ def build_parser() -> argparse.ArgumentParser:
         )
         target.add_argument("--tiles-file", type=Path, help="Text file containing tile names.")
 
+    def add_transport_arguments(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--workers",
+            type=int,
+            default=2,
+            help="Concurrent downloads to run at once. Default: 2",
+        )
+        target.add_argument(
+            "--batch-delay",
+            type=float,
+            default=3.0,
+            help="Seconds to wait between 10-tile download batches. Default: 3",
+        )
+        target.add_argument(
+            "--timeout",
+            type=float,
+            default=120.0,
+            help="Per-request timeout in seconds. Default: 120",
+        )
+        target.add_argument("--referer", help="HTTP Referer header. Overrides env/config values.")
+        target.add_argument(
+            "--user-agent",
+            help="HTTP User-Agent header. Overrides env/config values.",
+        )
+        target.add_argument(
+            "--headers-file",
+            type=Path,
+            default=DEFAULT_HEADERS_FILE,
+            help=f"Optional env-style file with CLSS_REFERER and CLSS_USER_AGENT. Default: {DEFAULT_HEADERS_FILE}",
+        )
+        target.add_argument(
+            "--trust-env-proxy",
+            action="store_true",
+            help="Use proxy settings from the environment. Disabled by default to avoid broken proxy configs.",
+        )
+        target.add_argument(
+            "--progress",
+            choices=("auto", "tqdm", "plain", "off"),
+            default="auto",
+            help="Progress output mode. Default: auto",
+        )
+        target.add_argument(
+            "--no-progress",
+            action="store_true",
+            help="Disable all progress output for real downloads.",
+        )
+
     tiles_parser = subparsers.add_parser("tiles", help="List tiles resolved from the supplied AOI and/or tile names.")
     add_selection_arguments(tiles_parser)
     tiles_parser.add_argument("--json", action="store_true", help="Print only the tile names as JSON.")
@@ -1192,8 +1353,8 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument(
         "--out-dir",
         type=Path,
-        default=Path("downloads"),
-        help="Destination directory for downloaded files. Default: ./downloads",
+        default=DEFAULT_OUT_DIR,
+        help=f"Destination directory for downloaded files. Default: {DEFAULT_OUT_DIR}",
     )
     download_parser.add_argument(
         "--flat",
@@ -1208,51 +1369,25 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--overwrite", action="store_true", help="Overwrite files that already exist.")
     download_parser.add_argument("--dry-run", action="store_true", help="Resolve tiles and print the download plan without downloading.")
     download_parser.add_argument(
-        "--workers",
-        type=int,
-        default=2,
-        help="Concurrent downloads to run at once. Default: 2",
-    )
-    download_parser.add_argument(
-        "--batch-delay",
-        type=float,
-        default=3.0,
-        help="Seconds to wait between 10-tile download batches. Default: 3",
-    )
-    download_parser.add_argument(
-        "--timeout",
-        type=float,
-        default=120.0,
-        help="Per-request timeout in seconds. Default: 120",
-    )
-    download_parser.add_argument("--referer", help="HTTP Referer header. Overrides env/config values.")
-    download_parser.add_argument(
-        "--user-agent",
-        help="HTTP User-Agent header. Overrides env/config values.",
-    )
-    download_parser.add_argument(
-        "--headers-file",
+        "--failure-log",
         type=Path,
-        default=DEFAULT_HEADERS_FILE,
-        help=f"Optional env-style file with CLSS_REFERER and CLSS_USER_AGENT. Default: {DEFAULT_HEADERS_FILE}",
+        default=None,
+        help=f"CSV file for failed downloads. Default: <out-dir>/{FAILURE_LOG_NAME}",
     )
-    download_parser.add_argument(
-        "--trust-env-proxy",
-        action="store_true",
-        help="Use proxy settings from the environment. Disabled by default to avoid broken proxy configs.",
-    )
-    download_parser.add_argument(
-        "--progress",
-        choices=("auto", "tqdm", "plain", "off"),
-        default="auto",
-        help="Progress output mode. Default: auto",
-    )
-    download_parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable all progress output for real downloads.",
-    )
+    add_transport_arguments(download_parser)
     download_parser.set_defaults(handler=run_download_command)
+
+    retry_parser = subparsers.add_parser("retry", help="Retry failed downloads from a failure log CSV.")
+    retry_parser.add_argument(
+        "--failure-log",
+        type=Path,
+        default=DEFAULT_OUT_DIR / FAILURE_LOG_NAME,
+        help=f"CSV file with failed downloads. Default: {DEFAULT_OUT_DIR / FAILURE_LOG_NAME}",
+    )
+    retry_parser.add_argument("--overwrite", action="store_true", help="Overwrite files that already exist.")
+    retry_parser.add_argument("--dry-run", action="store_true", help="Print the retry plan without downloading.")
+    add_transport_arguments(retry_parser)
+    retry_parser.set_defaults(handler=run_retry_command)
 
     return parser
 
